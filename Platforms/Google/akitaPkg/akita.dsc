@@ -79,6 +79,8 @@
   #
   ZumaPkg/Drivers/ZumaUfsDxe/ZumaUfsDxe.inf
   akitaPkg/Drivers/AkitaSlotDxe/AkitaSlotDxe.inf
+  # an EFI serial port over the serial library (the pstore log): applications' serial output lands there too
+  MdeModulePkg/Universal/SerialDxe/SerialDxe.inf
   MdeModulePkg/Bus/Scsi/ScsiBusDxe/ScsiBusDxe.inf
   MdeModulePkg/Bus/Scsi/ScsiDiskDxe/ScsiDiskDxe.inf
 
