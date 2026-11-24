@@ -2,11 +2,10 @@
   zuma's UFS host controller (ufs@13200000) for the firmware, as an EFI SCSI pass-through: EDK2's SCSI bus and disk
   drivers make a block device of each logical unit on top of it, its partition driver the GPT partitions.
 
-  Google's bootloader reads the boot image from UFS, so when the firmware starts the controller is enabled, the link
-  is up (HS gear 4, two lanes) and its transfer request list runs, in the bootloader's memory. The firmware takes it
-  over as it is: with nothing in flight the list is stopped, pointed at a list of the firmware's own, and started
-  again. No reset, no link startup, no UIC command, no PHY, clock or power setting; the task management list is not
-  touched.
+  Google's bootloader leaves the host enabled but switches the device off before it hands over, so the firmware
+  brings the whole thing up again, in the order Google's Linux driver does: the device's supply and pins, the host's
+  reset and enable (with the vendor steps of ZumaUfsCalLib around it), Samsung's PHY calibration before and after
+  the link startup, the device's initialisation (NOP OUT, fDeviceInit), then the power mode change to HS.
 
   Read only for now: only commands that read (and the ones that ask the device about itself) reach the device; a
   write is refused here, whatever the layers above ask.
@@ -27,7 +26,11 @@
 #include <Library/MemoryMapHelperLib.h>
 #include <Library/TimerLib.h>
 #include <Library/UefiBootServicesTableLib.h>
+#include <Library/UefiLib.h>
+#include <Library/ZumaUfsCalLib.h>
+#include <Protocol/BlockIo.h>
 #include <Protocol/DevicePath.h>
+#include <Protocol/PartitionInfo.h>
 #include <Protocol/ScsiPassThruExt.h>
 
 #include "Ufshci.h"
@@ -35,52 +38,13 @@
 #define UFS_LUNS       8                // the logical units offered (the phone has 0-3: user, boot A/B, a small one)
 #define IO_ALIGN       64               // the cache line: buffers the controller writes into must not share one
 #define DEFAULT_WAIT   (5 * 1000 * 1000)  // microseconds, when a request names no timeout
+#define BOUNCE_SIZE    SIZE_64KB        // for small buffers that are not aligned (SCSI disk's on its stack)
 
 STATIC UINTN       mBase;
 STATIC UTRD        *mList;              // 32 descriptors, 1 KiB aligned; the driver uses slot 0
 STATIC UINT8       *mUcd;               // slot 0's command descriptor, 128-byte aligned
 STATIC UINT8       mTag;
-STATIC UINTN       mDumps;
-
-//
-// (bring-up) the vendor state that decides whether the controller takes requests: clock stops, auto-Hibern8,
-// its state machine and DMA monitors
-//
-STATIC
-VOID
-DumpState (
-  IN CONST CHAR8  *When
-  )
-{
-  UINTN  V = mBase + UFS_VS_HCI;
-
-  DEBUG ((DEBUG_WARN, "ZumaUfs: [%a] AHIT 0x%08x CLKSTOP_CTRL 0x%08x FORCE_HCS 0x%08x ACG_DISABLE 0x%08x AH8_STATE 0x%08x\n",
-    When, MmioRead32 (mBase + 0x18), MmioRead32 (V + 0xB0), MmioRead32 (V + 0xB4), MmioRead32 (V + 0xFC), MmioRead32 (V + 0x50C)));
-  DEBUG ((DEBUG_WARN, "ZumaUfs: [%a] FSM 0x%08x DMA0 0x%08x/0x%08x DMA1 0x%08x DBR_DEBUG 0x%08x/0x%08x DBR 0x%08x HCS 0x%08x IS 0x%08x\n",
-    When, MmioRead32 (V + 0xC0), MmioRead32 (V + 0xC8), MmioRead32 (V + 0xCC), MmioRead32 (V + 0xD0), MmioRead32 (V + 0xD8),
-    MmioRead32 (V + 0xDC), MmioRead32 (mBase + UFS_UTRLDBR), MmioRead32 (mBase + UFS_HCS), MmioRead32 (mBase + UFS_IS)));
-  {
-    //
-    // the S2MPU in front of HSI2 (s2mpu_s0_hsi2@131f0000), where UFS sits: whether it lets the controller's DMA through
-    //
-    UINTN   S = 0x131F0000;
-    UINT32  Vid;
-
-    DEBUG ((DEBUG_WARN, "ZumaUfs: [%a] S2MPU HSI2: reading VERSION\n", When));
-    DEBUG ((DEBUG_WARN, "ZumaUfs: [%a] S2MPU HSI2: VERSION 0x%08x\n", When, MmioRead32 (S + 0x60)));
-    DEBUG ((DEBUG_WARN, "ZumaUfs: [%a] S2MPU HSI2: CTRL0 0x%08x\n", When, MmioRead32 (S + 0x0)));
-    DEBUG ((DEBUG_WARN, "ZumaUfs: [%a] S2MPU HSI2: PROT_EN_PER_VID 0x%08x STATUS 0x%08x\n", When, MmioRead32 (S + 0x50),
-      MmioRead32 (S + 0x68)));
-    DEBUG ((DEBUG_WARN, "ZumaUfs: [%a] S2MPU HSI2: FAULT_STATUS 0x%08x\n", When, MmioRead32 (S + 0x2000)));
-    (VOID)Vid;
-  }
-}
-STATIC BOOLEAN     mInPlace = FALSE;             // (bring-up test, see TakeOver)
 STATIC UINT8       *mBounce;
-#define ABL_UCD     0xF9400000ULL
-#define ABL_BOUNCE  0xF9500000ULL
-#define BOUNCE_SIZE SIZE_4MB
-
 #pragma pack(1)
 typedef struct {
   VENDOR_DEVICE_PATH          Vendor;
@@ -143,7 +107,8 @@ Discard (
 }
 
 //
-// One request through slot 0, waited for. The data buffer must be IO_ALIGN-aligned (the mode says so).
+// One request through slot 0, waited for. A data buffer that is not IO_ALIGN-aligned, or whose length is not whole
+// double words (the PRDT's unit), goes through the bounce buffer.
 //
 STATIC
 EFI_STATUS
@@ -158,14 +123,15 @@ Transfer (
   UTRD           *Utrd;
   UINT8          *Data;
   UINT32         Length;
+  UINT32         Mapped;
   UINT32         Left;
+  UINT8          *Caller;
   UINTN          Entries;
   BOOLEAN        Read;
   UINT64         Waited;
   UINT64         Limit;
   UINT32         Is;
   UINTN          SenseBytes;
-  UINT8          *Caller = NULL;
 
   if ((Packet->CdbLength == 0) || (Packet->CdbLength > 16) || (Packet->Cdb == NULL)) {
     return EFI_INVALID_PARAMETER;
@@ -182,11 +148,21 @@ Transfer (
     return EFI_UNSUPPORTED;                // a command that sends data: none is permitted yet
   }
 
-  if ((Length != 0) && ((Data == NULL) || (((UINTN)Data & (IO_ALIGN - 1)) != 0) || ((Length & 3) != 0) ||
-                        (Length > PRDT_ENTRIES * PRDT_MAX_BYTES)))
-  {
+  if ((Length != 0) && ((Data == NULL) || (Length > PRDT_ENTRIES * PRDT_MAX_BYTES))) {
     return EFI_INVALID_PARAMETER;
   }
+
+  Caller = NULL;
+  if ((Length != 0) && ((((UINTN)Data & (IO_ALIGN - 1)) != 0) || ((Length & 3) != 0))) {
+    if (Length > BOUNCE_SIZE) {
+      return EFI_INVALID_PARAMETER;
+    }
+
+    Caller = Data;
+    Data   = mBounce;
+  }
+
+  Mapped = ALIGN_VALUE (Length, 4);
 
   if (MmioRead32 (mBase + UFS_UTRLDBR) & 1) {
     return EFI_DEVICE_ERROR;                // slot 0 is busy: something went wrong before
@@ -206,19 +182,10 @@ Transfer (
   Command->ExpectedLength = SwapBytes32 (Length);
   CopyMem (Command->Cdb, Packet->Cdb, Packet->CdbLength);
 
-  if ((mBounce != NULL) && (Length != 0)) {
-    if (Length > BOUNCE_SIZE) {
-      return EFI_BAD_BUFFER_SIZE;
-    }
-
-    Caller = Data;
-    Data   = mBounce;
-  }
-
   Entries = 0;
-  for (Left = Length; Left > 0; Entries++) {
+  for (Left = Mapped; Left > 0; Entries++) {
     UINT32  Chunk = MIN (Left, (UINT32)PRDT_MAX_BYTES);
-    UINT64  At    = (UINT64)(UINTN)Data + (Length - Left);
+    UINT64  At    = (UINT64)(UINTN)Data + (Mapped - Left);
 
     Prdt[Entries].Address     = (UINT32)At;
     Prdt[Entries].AddressHigh = (UINT32)(At >> 32);
@@ -243,17 +210,12 @@ Transfer (
   Flush (mUcd, UCD_SIZE);
   Flush (Utrd, sizeof (*Utrd));
   if (Length != 0) {
-    WriteBackInvalidateDataCacheRange (Data, Length);   // no dirty line may land on what the device writes
+    WriteBackInvalidateDataCacheRange (Data, Mapped);   // no dirty line may land on what the device writes
   }
 
   MmioWrite32 (mBase + UFS_IS, IS_UTRCS);
   MmioOr32 (mBase + UFS_VS_HCI + VS_UTRL_NEXUS_TYPE, 1);    // slot 0 carries a SCSI command
   MmioWrite32 (mBase + UFS_UTRLDBR, 1);
-  if (mDumps < 2) {
-    MicroSecondDelay (1000);
-    DumpState ("1 ms after the doorbell");
-    mDumps++;
-  }
 
   Limit = (Packet->Timeout != 0) ? DivU64x32 (Packet->Timeout, 10) : DEFAULT_WAIT;
   for (Waited = 0; (MmioRead32 (mBase + UFS_UTRLDBR) & 1) && (Waited < Limit); Waited += 10) {
@@ -271,7 +233,7 @@ Transfer (
   Discard (Utrd, sizeof (*Utrd));
   Discard (mUcd, UCD_SIZE);
   if (Length != 0) {
-    Discard (Data, Length);
+    Discard (Data, Mapped);
     if (Caller != NULL) {
       CopyMem (Caller, Data, Length);
     }
@@ -296,6 +258,31 @@ Transfer (
 
   if (Read) {
     Packet->InTransferLength = Length - MIN (Length, SwapBytes32 (Response->ResidualCount));
+  }
+
+  //
+  // (bring-up) what each logical unit says about itself
+  //
+  if (Response->Status == EFI_EXT_SCSI_STATUS_TARGET_GOOD) {
+    if ((Command->Cdb[0] == EFI_SCSI_OP_INQUIRY) && ((Command->Cdb[1] & 1) == 0) && (Packet->InTransferLength >= 36)) {
+      DEBUG ((DEBUG_WARN, "ZumaUfs: LUN %u INQUIRY: type 0x%02x \"%.8a\" \"%.16a\" rev \"%.4a\"\n", Lun, Data[0] & 0x1F,
+        Data + 8, Data + 16, Data + 32));
+    } else if ((Command->Cdb[0] == EFI_SCSI_OP_READ_CAPACITY) && (Packet->InTransferLength >= 8)) {
+      DEBUG ((DEBUG_WARN, "ZumaUfs: LUN %u READ CAPACITY(10): last LBA 0x%x, block %u\n", Lun, SwapBytes32 (*(UINT32 *)Data),
+        SwapBytes32 (*(UINT32 *)(Data + 4))));
+    } else if ((Command->Cdb[0] == EFI_SCSI_OP_READ_CAPACITY16) && (Packet->InTransferLength >= 12)) {
+      DEBUG ((DEBUG_WARN, "ZumaUfs: LUN %u READ CAPACITY(16): last LBA 0x%lx, block %u\n", Lun, SwapBytes64 (ReadUnaligned64 ((UINT64 *)Data)),
+        SwapBytes32 (*(UINT32 *)(Data + 8))));
+    }
+  } else if ((SenseBytes < 3) || (((Response->Sense[2] & 0xF) != EFI_SCSI_SK_ILLEGAL_REQUEST) &&
+                                   ((Response->Sense[2] & 0xF) != EFI_SCSI_SK_UNIT_ATTENTION)))
+  {
+    //
+    // (the expected ones left out: a logical unit that does not exist, MODE SENSE(6) that UFS does not have, the
+    // unit attention after the reset)
+    //
+    DEBUG ((DEBUG_WARN, "ZumaUfs: LUN %u op 0x%02x: status 0x%02x, sense key 0x%x\n", Lun, Command->Cdb[0], Response->Status,
+      (SenseBytes >= 3) ? (Response->Sense[2] & 0xF) : 0));
   }
 
   return EFI_SUCCESS;
@@ -429,7 +416,7 @@ UfsResetChannel (
   IN EFI_EXT_SCSI_PASS_THRU_PROTOCOL  *This
   )
 {
-  return EFI_UNSUPPORTED;         // never: the link is the bootloader's, and it works
+  return EFI_UNSUPPORTED;
 }
 
 STATIC
@@ -483,17 +470,32 @@ STATIC EFI_EXT_SCSI_PASS_THRU_PROTOCOL  mPassThru = {
 
 
 //
-// ---- bringing the device back ----------------------------------------------------------------------------------
+// ---- bring-up ------------------------------------------------------------------------------------------------------
 //
-// Google's bootloader leaves the host as it used it (enabled, its PHY set up for HS gear 4) but switches the device off
-// before it hands over: its supply (gpp0-1 of pinctrl@10840000) low, its reset line (gph5-0 of pinctrl@13060000) a GPIO
-// driven low, the controller's own reset output (vendor GPIO_OUT) 0. The device is powered and released again, and the
-// link started from the host's side, with the PHY as the bootloader set it: no host reset, no PHY setting.
+// The phone's tree: ufs@13200000's register ranges (standard HCI, vendor HCI, UniPro, UFS protector, PHY, CPort), the
+// unipro clock's rate (178 MHz, as Android reports it and as the bootloader's 1 us tick, 0xB2, says), the CAL's board
+// (brd-for-cal) and the power mode it is meant to reach (ufs,pmd-attr-lane / -gear, HS series B). It has no evt-ver:
+// Linux takes 0 then (and the CAL's evt0 and evt1 tables are the same for zuma).
+//
+#define UFS_PMA_OFFSET      0x4000          // 0x13204000, in the "UFS" region
+#define UFS_CPORT_OFFSET    0x8000          // 0x13208000, in the "UFS" region
+#define UFS_UFSP_OFFSET     0x20000         // 0x132a0000, in the "UFS UniPro" region
+#define UFS_MCLK_RATE       178000000
+#define UFS_CAL_BOARD       1
+#define UFS_CAL_EVT_VER     0
+#define UFS_PMD_LANES       2
+#define UFS_PMD_GEAR        4
+
+//
+// The device's supply (gpp0-1 of pinctrl@10840000, the ufs-vcc fixed regulator) and its pins (gph5-0, the reset, and
+// gph5-1, the reference clock, of pinctrl@13060000): the bootloader leaves the supply off and the reset a GPIO low
 //
 #define GPIO_ALIVE_GPP0     0x10840000ULL   // CON, DAT at +4
 #define GPIO_HSI2_GPH5      0x13060000ULL
 #define UFS_VCC_PIN         1
-#define GPH5_UFS_FUNCTIONS  0x22            // gph5-0 and gph5-1 to their UFS function (2): the reset and the refclk
+#define GPH5_UFS_FUNCTIONS  0x22            // gph5-0 and gph5-1 to their UFS function (2)
+
+STATIC UINTN  mUnipro;
 
 STATIC
 EFI_STATUS
@@ -506,7 +508,8 @@ UicCommand (
   OUT UINT32  *Value OPTIONAL
   )
 {
-  UINTN  Waited;
+  UINTN   Waited;
+  UINT32  Code;
 
   for (Waited = 0; (MmioRead32 (mBase + UFS_HCS) & HCS_UCRDY) == 0; Waited += 10) {
     if (Waited > 100000) {
@@ -530,70 +533,200 @@ UicCommand (
   }
 
   MmioWrite32 (mBase + UFS_IS, IS_UCCS);
+  Code = MmioRead32 (mBase + UFS_UICARG2) & 0xFF;
   if (Result != NULL) {
-    *Result = MmioRead32 (mBase + UFS_UICARG2) & 0xFF;
+    *Result = Code;
   }
 
   if (Value != NULL) {
     *Value = MmioRead32 (mBase + UFS_UICARG3);
   }
 
-  return ((MmioRead32 (mBase + UFS_UICARG2) & 0xFF) == 0) ? EFI_SUCCESS : EFI_DEVICE_ERROR;
+  return (Code == 0) ? EFI_SUCCESS : EFI_DEVICE_ERROR;
 }
 
 STATIC
 EFI_STATUS
-DeviceUp (
-  VOID
+DmeSet (
+  IN UINT16  Attribute,
+  IN UINT32  Value
   )
 {
   EFI_STATUS  Status;
   UINT32      Result;
-  UINTN       Try;
 
-  MmioOr32 (GPIO_ALIVE_GPP0 + 4, 1u << UFS_VCC_PIN);                    // the supply on
-  MicroSecondDelay (20000);
-  MmioWrite32 (GPIO_HSI2_GPH5, (MmioRead32 (GPIO_HSI2_GPH5) & ~0xFFu) | GPH5_UFS_FUNCTIONS);
-  MmioWrite32 (mBase + UFS_VS_HCI + VS_GPIO_OUT, 0);
-  MicroSecondDelay (10);
-  MmioWrite32 (mBase + UFS_VS_HCI + VS_GPIO_OUT, 1);                    // out of reset
-  MicroSecondDelay (1000);
-
-  Status = EFI_DEVICE_ERROR;
-  for (Try = 0; Try < 4; Try++) {
-    if (Try == 1) {
-      //
-      // (bring-up) the host's UniPro may be left in Hibern8 by the bootloader: the controller reset (HCE 0 -> 1) brings
-      // it back to its initial state; the PHY's registers are a block of their own and keep what the bootloader set
-      //
-      UINTN  Waited;
-
-      MmioWrite32 (mBase + UFS_HCE, 0);
-      for (Waited = 0; (MmioRead32 (mBase + UFS_HCE) & 1) && Waited < 100000; Waited += 10) {
-        MicroSecondDelay (10);
-      }
-
-      MicroSecondDelay (1000);
-      MmioWrite32 (mBase + UFS_HCE, 1);
-      for (Waited = 0; !(MmioRead32 (mBase + UFS_HCE) & 1) && Waited < 100000; Waited += 10) {
-        MicroSecondDelay (10);
-      }
-
-      DEBUG ((DEBUG_WARN, "ZumaUfs: host reset: HCE 0x%x HCS 0x%08x\n", MmioRead32 (mBase + UFS_HCE), MmioRead32 (mBase + UFS_HCS)));
-    }
-
-    Result = 0xFF;
-    Status = UicCommand (UIC_DME_LINKSTARTUP, 0, 0, 0, &Result, NULL);
-    DEBUG ((DEBUG_WARN, "ZumaUfs: link startup %u: %r (result %u), HCS 0x%08x IS 0x%08x\n", Try + 1, Status, Result,
-      MmioRead32 (mBase + UFS_HCS), MmioRead32 (mBase + UFS_IS)));
-    if (!EFI_ERROR (Status) && (MmioRead32 (mBase + UFS_HCS) & HCS_DP)) {
-      break;
-    }
-
-    MicroSecondDelay (10000);
+  Status = UicCommand (UIC_DME_SET, UIC_ARG_MIB (Attribute), 0, Value, &Result, NULL);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "ZumaUfs: DME_SET 0x%04x = %u: %r (result %u)\n", Attribute, Value, Status, Result));
   }
 
   return Status;
+}
+
+STATIC
+UINT32
+DmeGet (
+  IN UINT32   Command,            // UIC_DME_GET or UIC_DME_PEER_GET
+  IN UINT16   Attribute
+  )
+{
+  UINT32  Value = 0;
+
+  if (EFI_ERROR (UicCommand (Command, UIC_ARG_MIB (Attribute), 0, 0, NULL, &Value))) {
+    return 0;
+  }
+
+  return Value;
+}
+
+//
+// The controller's enable (ufshcd_hba_execute_hce): HCE to 0, the vendor steps, HCE to 1 and wait, the vendor steps
+//
+STATIC
+EFI_STATUS
+HostEnable (
+  VOID
+  )
+{
+  EFI_STATUS  Status;
+  UINTN       Waited;
+
+  if (MmioRead32 (mBase + UFS_HCE) & 1) {
+    MmioWrite32 (mBase + UFS_HCE, 0);
+    for (Waited = 0; MmioRead32 (mBase + UFS_HCE) & 1; Waited += 10) {
+      if (Waited > 10000) {
+        DEBUG ((DEBUG_ERROR, "ZumaUfs: HCE does not clear\n"));
+        return EFI_TIMEOUT;
+      }
+
+      MicroSecondDelay (10);
+    }
+  }
+
+  Status = ZumaUfsHostPreHce ();
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  MmioWrite32 (mBase + UFS_HCE, 1);
+  MicroSecondDelay (1000);
+  for (Waited = 0; (MmioRead32 (mBase + UFS_HCE) & 1) == 0; Waited++) {
+    if (Waited > 50) {
+      DEBUG ((DEBUG_ERROR, "ZumaUfs: the controller does not enable\n"));
+      return EFI_TIMEOUT;
+    }
+
+    MicroSecondDelay (1000);
+  }
+
+  return ZumaUfsHostPostHce ();
+}
+
+//
+// The link startup (ufshcd_link_startup): a failed attempt re-enables the controller; a device that was not active
+// gets the whole startup twice
+//
+STATIC
+EFI_STATUS
+LinkStartup (
+  OUT UINT8  *Lanes,
+  OUT UINT8  *MaxGear
+  )
+{
+  EFI_STATUS  Status;
+  UINT32      Result;
+  UINTN       Round;
+  UINTN       Try;
+
+  for (Round = 0; Round < 2; Round++) {
+    for (Try = 0; Try < 4; Try++) {
+      if (Try > 0) {
+        Status = HostEnable ();
+        if (EFI_ERROR (Status)) {
+          return Status;
+        }
+      }
+
+      Status = ZumaUfsHostPreLink ();
+      if (EFI_ERROR (Status)) {
+        return Status;
+      }
+
+      Result = 0xFF;
+      Status = UicCommand (UIC_DME_LINKSTARTUP, 0, 0, 0, &Result, NULL);
+      DEBUG ((DEBUG_WARN, "ZumaUfs: link startup (round %u, try %u): %r (result %u), HCS 0x%08x\n", Round + 1, Try + 1,
+        Status, Result, MmioRead32 (mBase + UFS_HCS)));
+      if (!EFI_ERROR (Status)) {
+        if ((MmioRead32 (mBase + UFS_HCS) & HCS_DP) == 0) {
+          DEBUG ((DEBUG_ERROR, "ZumaUfs: link up but no device present\n"));
+          return EFI_NOT_FOUND;
+        }
+
+        break;
+      }
+    }
+
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+  }
+
+  Status = ZumaUfsHostPostLink (Lanes, MaxGear);
+  MmioRead32 (mBase + UFS_UECPA);         // the line reset of the link startup left an error code here
+  return Status;
+}
+
+//
+// The power mode change (ufshcd_change_power_mode, with the vendor steps around it): FAST mode, HS series B
+//
+STATIC
+EFI_STATUS
+PowerModeChange (
+  IN UINT8  Gear,
+  IN UINT8  Lanes
+  )
+{
+  EFI_STATUS  Status;
+  UINTN       Waited;
+  UINT32      Hcs;
+  UINT32      Mode = ZUMA_UFS_FAST_MODE;
+
+  Status = ZumaUfsHostPrePmc ((UINT8)Mode, Gear, Lanes, ZUMA_UFS_HS_SERIES_B);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  if (EFI_ERROR (DmeSet (PA_RXGEAR, Gear)) || EFI_ERROR (DmeSet (PA_ACTIVERXDATALANES, Lanes)) ||
+      EFI_ERROR (DmeSet (PA_RXTERMINATION, 1)) || EFI_ERROR (DmeSet (PA_TXGEAR, Gear)) ||
+      EFI_ERROR (DmeSet (PA_ACTIVETXDATALANES, Lanes)) || EFI_ERROR (DmeSet (PA_TXTERMINATION, 1)) ||
+      EFI_ERROR (DmeSet (PA_HSSERIES, ZUMA_UFS_HS_SERIES_B)))
+  {
+    return EFI_DEVICE_ERROR;
+  }
+
+  MmioWrite32 (mBase + UFS_IS, IS_UPMS);
+  Status = DmeSet (PA_PWRMODE, (Mode << 4) | Mode);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  for (Waited = 0; (MmioRead32 (mBase + UFS_IS) & IS_UPMS) == 0; Waited += 10) {
+    if (Waited > 500000) {
+      DEBUG ((DEBUG_ERROR, "ZumaUfs: power mode change: no completion\n"));
+      return EFI_TIMEOUT;
+    }
+
+    MicroSecondDelay (10);
+  }
+
+  MmioWrite32 (mBase + UFS_IS, IS_UPMS);
+  Hcs = MmioRead32 (mBase + UFS_HCS);
+  if (HCS_UPMCRS (Hcs) != UPMCRS_PWR_LOCAL) {
+    DEBUG ((DEBUG_ERROR, "ZumaUfs: power mode change: UPMCRS %u\n", HCS_UPMCRS (Hcs)));
+    return EFI_DEVICE_ERROR;
+  }
+
+  return ZumaUfsHostPostPmc ();
 }
 
 //
@@ -654,6 +787,7 @@ DeviceInit (
   UINTN       Try;
 
   ZeroMem (Request, sizeof (Request));
+  ZeroMem (Response, sizeof (Response));
   Request[0] = UPIU_NOP_OUT;
   for (Try = 0; Try < 10; Try++) {
     Status = SendUpiu (Request, Response);
@@ -675,8 +809,8 @@ DeviceInit (
   Request[12] = QUERY_OP_SET_FLAG;
   Request[13] = FLAG_DEVICE_INIT;
   Status      = SendUpiu (Request, Response);
-  DEBUG ((DEBUG_WARN, "ZumaUfs: set fDeviceInit -> %r, response 0x%02x\n", Status, Response[6]));
   if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "ZumaUfs: set fDeviceInit -> %r, response 0x%02x\n", Status, Response[6]));
     return Status;
   }
 
@@ -700,106 +834,156 @@ DeviceInit (
 }
 
 //
-// The takeover: the bootloader's list out, the firmware's in, with nothing in flight
+// Everything from the device's power to a link in PWM gear 1 (the link startup's mode) with the device initialised
+// and the transfer list running
 //
 STATIC
 EFI_STATUS
-TakeOver (
-  VOID
+BringUp (
+  OUT UINT8  *Lanes,
+  OUT UINT8  *MaxGear
   )
 {
-  UINT32  Hcs;
-  UINTN   Waited;
-  UINT64  Old;
+  EFI_STATUS  Status;
 
-  DumpState ("as left");
-  DEBUG ((DEBUG_WARN, "ZumaUfs: device side as left: GPIO_OUT (reset, 1 = released) 0x%x; supply gpp0: CON 0x%08x DAT 0x%08x; pins gph5: CON 0x%08x DAT 0x%08x PUD 0x%08x; PMU phy iso 0x%08x; sysreg IOCC 0x%08x\n",
-    MmioRead32 (mBase + UFS_VS_HCI + 0x70), MmioRead32 (0x10840000), MmioRead32 (0x10840004), MmioRead32 (0x13060000),
-    MmioRead32 (0x13060004), MmioRead32 (0x13060008), MmioRead32 (0x15463EC0), MmioRead32 (0x13020710)));
-  {
-    //
-    // (bring-up) the bootloader's last descriptors and one of its command descriptors: the format this controller took
-    //
-    UINT32  *L = (UINT32 *)(UINTN)(LShiftU64 (MmioRead32 (mBase + UFS_UTRLBAU), 32) | MmioRead32 (mBase + UFS_UTRLBA));
-    UINTN   Slot, W;
+  //
+  // the device: held in reset, its supply on, its pins to the controller
+  //
+  MmioWrite32 (mBase + UFS_VS_HCI + VS_GPIO_OUT, 0);
+  MmioOr32 (GPIO_ALIVE_GPP0 + 4, 1u << UFS_VCC_PIN);
+  MicroSecondDelay (20000);
+  MmioWrite32 (GPIO_HSI2_GPH5, (MmioRead32 (GPIO_HSI2_GPH5) & ~0xFFu) | GPH5_UFS_FUNCTIONS);
 
-    for (Slot = 0; Slot < 32; Slot++) {
-      UINT32  *D = L + Slot * 8;
-
-      if ((D[0] | D[4] | D[5]) == 0) {
-        continue;
-      }
-
-      DEBUG ((DEBUG_WARN, "ZumaUfs: ABL slot %2u: %08x %08x %08x %08x %08x %08x %08x %08x\n", Slot, D[0], D[1], D[2], D[3],
-        D[4], D[5], D[6], D[7]));
-      if (Slot == 1) {
-        UINT32  *U = (UINT32 *)(UINTN)(LShiftU64 (D[5], 32) | (D[4] & ~0x7Fu));
-
-        for (W = 0; W < 0x140 / 4; W += 8) {
-          DEBUG ((DEBUG_WARN, "ZumaUfs:   ucd+%03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", W * 4, U[W], U[W + 1], U[W + 2],
-            U[W + 3], U[W + 4], U[W + 5], U[W + 6], U[W + 7]));
-        }
-      }
-    }
-
-    for (W = 0; W < 0x120; W += 0x10) {
-      DEBUG ((DEBUG_WARN, "ZumaUfs: vs_hci+%02x: %08x %08x %08x %08x\n", W, MmioRead32 (mBase + UFS_VS_HCI + W),
-        MmioRead32 (mBase + UFS_VS_HCI + W + 4), MmioRead32 (mBase + UFS_VS_HCI + W + 8), MmioRead32 (mBase + UFS_VS_HCI + W + 12)));
-    }
+  Status = HostEnable ();
+  if (EFI_ERROR (Status)) {
+    return Status;
   }
-  Hcs = MmioRead32 (mBase + UFS_HCS);
-  if ((MmioRead32 (mBase + UFS_HCE) & 1) == 0 || (Hcs & (HCS_DP | HCS_UTRLRDY)) != (HCS_DP | HCS_UTRLRDY)) {
-    DEBUG ((DEBUG_ERROR, "ZumaUfs: the controller is not as the bootloader should leave it (HCE 0x%x HCS 0x%x): left alone\n",
-      MmioRead32 (mBase + UFS_HCE), Hcs));
+
+  Status = LinkStartup (Lanes, MaxGear);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  if ((MmioRead32 (mBase + UFS_HCS) & HCS_READY) != HCS_READY) {
+    DEBUG ((DEBUG_ERROR, "ZumaUfs: the controller is not ready for lists: HCS 0x%08x\n", MmioRead32 (mBase + UFS_HCS)));
     return EFI_NOT_READY;
   }
 
-  for (Waited = 0; MmioRead32 (mBase + UFS_UTRLDBR) != 0; Waited += 10) {
-    if (Waited > 100000) {
-      DEBUG ((DEBUG_ERROR, "ZumaUfs: requests in flight (doorbell 0x%x): left alone\n", MmioRead32 (mBase + UFS_UTRLDBR)));
-      return EFI_NOT_READY;
-    }
+  MmioWrite32 (mBase + UFS_IS, MmioRead32 (mBase + UFS_IS));
+  MmioWrite32 (mBase + UFS_UTRLBA, (UINT32)(UINTN)mList);
+  MmioWrite32 (mBase + UFS_UTRLBAU, (UINT32)((UINT64)(UINTN)mList >> 32));
+  MmioWrite32 (mBase + UFS_UTRLRSR, 1);
 
-    MicroSecondDelay (10);
-  }
+  return DeviceInit ();
+}
 
-  //
-  // (bring-up test) the bootloader's list stays where it is; the command descriptor and the bounce buffer go into
-  // the bootloader's memory, which the controller's DMA is known to reach
-  //
-  if (mInPlace) {
-    Old    = LShiftU64 (MmioRead32 (mBase + UFS_UTRLBAU), 32) | MmioRead32 (mBase + UFS_UTRLBA);
-    mList  = (UTRD *)(UINTN)Old;
-    mUcd   = (UINT8 *)(UINTN)ABL_UCD;
-    mBounce = (UINT8 *)(UINTN)ABL_BOUNCE;
-    DEBUG ((DEBUG_WARN, "ZumaUfs: (test) the bootloader's list kept at 0x%lx, descriptor at 0x%p, bounce at 0x%p\n", Old,
-      mUcd, mBounce));
-    return EFI_SUCCESS;
-  }
+STATIC
+EFI_STATUS
+Start (
+  VOID
+  )
+{
+  ZUMA_UFS_HOST_CONFIG  Config;
+  EFI_STATUS            Status;
+  UINT8                 Lanes;
+  UINT8                 MaxGear;
+  UINT8                 PeerGear;
+  UINT8                 Gear;
 
   mList = AllocateAlignedPages (1, SIZE_4KB);
   mUcd  = AllocateAlignedPages (EFI_SIZE_TO_PAGES (UCD_SIZE) + 1, SIZE_4KB);    // slot 0's, then slot 1's (4 KiB)
-  if ((mList == NULL) || (mUcd == NULL)) {
+  mBounce = AllocateAlignedPages (EFI_SIZE_TO_PAGES (BOUNCE_SIZE), SIZE_4KB);
+  if ((mList == NULL) || (mUcd == NULL) || (mBounce == NULL)) {
     return EFI_OUT_OF_RESOURCES;
   }
 
   ZeroMem (mList, SIZE_4KB);
   Flush (mList, SIZE_4KB);
 
-  DEBUG ((DEBUG_WARN, "ZumaUfs: nexus types as left: transfer 0x%08x, task management 0x%08x\n",
-    MmioRead32 (mBase + UFS_VS_HCI + VS_UTRL_NEXUS_TYPE), MmioRead32 (mBase + UFS_VS_HCI + VS_UTMRL_NEXUS_TYPE)));
-  Old = LShiftU64 (MmioRead32 (mBase + UFS_UTRLBAU), 32) | MmioRead32 (mBase + UFS_UTRLBA);
-  MmioWrite32 (mBase + UFS_UTRLRSR, 0);
-  if (EFI_ERROR (DeviceUp ())) {
-    return EFI_DEVICE_ERROR;
+  Config.Std      = mBase;
+  Config.Hci      = mBase + UFS_VS_HCI;
+  Config.Unipro   = mUnipro;
+  Config.Ufsp     = mUnipro + UFS_UFSP_OFFSET;
+  Config.Pma      = mBase + UFS_PMA_OFFSET;
+  Config.Cport    = mBase + UFS_CPORT_OFFSET;
+  Config.MclkRate = UFS_MCLK_RATE;
+  Config.Board    = UFS_CAL_BOARD;
+  Config.EvtVer   = UFS_CAL_EVT_VER;
+  Config.Gear     = UFS_PMD_GEAR;
+  Status          = ZumaUfsHostInit (&Config);
+  if (EFI_ERROR (Status)) {
+    return Status;
   }
 
-  MmioWrite32 (mBase + UFS_UTRLBA, (UINT32)(UINTN)mList);
-  MmioWrite32 (mBase + UFS_UTRLBAU, (UINT32)((UINT64)(UINTN)mList >> 32));
-  MmioWrite32 (mBase + UFS_UTRLRSR, 1);
-  DEBUG ((DEBUG_WARN, "ZumaUfs: transfer list moved from 0x%lx to 0x%p (%u slots, UFSHCI %x.%x)\n", Old, mList,
-    (MmioRead32 (mBase + UFS_CAP) & 0x1F) + 1, (MmioRead32 (mBase + UFS_VER) >> 8) & 0xF, (MmioRead32 (mBase + UFS_VER) >> 4) & 0xF));
-  return DeviceInit ();
+  DEBUG ((DEBUG_WARN, "ZumaUfs: CAL: mclk %u Hz, board %u, evt %u (the tree has no evt-ver)\n", Config.MclkRate,
+    Config.Board, Config.EvtVer));
+
+  Status = BringUp (&Lanes, &MaxGear);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  //
+  // HS: the gear both sides can do, at most the tree's; on failure the link is brought up again and left in PWM
+  //
+  PeerGear = (UINT8)DmeGet (UIC_DME_PEER_GET, PA_MAXRXHSGEAR);
+  Gear     = MIN (MaxGear, PeerGear);
+  Lanes    = MIN (Lanes, (UINT8)UFS_PMD_LANES);
+  if ((Gear == 0) || (Lanes == 0)) {
+    DEBUG ((DEBUG_WARN, "ZumaUfs: no HS gear (host %u, device %u): staying in PWM gear 1\n", MaxGear, PeerGear));
+    return EFI_SUCCESS;
+  }
+
+  Status = PowerModeChange (Gear, Lanes);
+  DEBUG ((DEBUG_WARN, "ZumaUfs: power mode change to HS gear %u, %u lanes, series B (device max gear %u): %r\n", Gear,
+    Lanes, PeerGear, Status));
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_WARN, "ZumaUfs: bringing the link up again, staying in PWM gear 1\n"));
+    return BringUp (&Lanes, &MaxGear);
+  }
+
+  return EFI_SUCCESS;
+}
+
+//
+// (bring-up) each partition EDK2's partition driver finds, with its GPT name
+//
+STATIC EFI_EVENT  mPartitionEvent;
+STATIC VOID       *mPartitionRegistration;
+
+STATIC
+VOID
+EFIAPI
+OnPartition (
+  IN EFI_EVENT  Event,
+  IN VOID       *Context
+  )
+{
+  EFI_HANDLE                   Handle;
+  UINTN                        Size;
+  EFI_PARTITION_INFO_PROTOCOL  *Info;
+  EFI_BLOCK_IO_PROTOCOL        *BlockIo;
+
+  for ( ; ;) {
+    Size = sizeof (Handle);
+    if (EFI_ERROR (gBS->LocateHandle (ByRegisterNotify, NULL, mPartitionRegistration, &Size, &Handle))) {
+      return;
+    }
+
+    if (EFI_ERROR (gBS->HandleProtocol (Handle, &gEfiPartitionInfoProtocolGuid, (VOID **)&Info))) {
+      continue;
+    }
+
+    BlockIo = NULL;
+    gBS->HandleProtocol (Handle, &gEfiBlockIoProtocolGuid, (VOID **)&BlockIo);
+    if (Info->Type == PARTITION_TYPE_GPT) {
+      DEBUG ((DEBUG_WARN, "ZumaUfs: partition \"%s\": LBA %lu-%lu (%lu blocks of %u)\n", Info->Info.Gpt.PartitionName,
+        Info->Info.Gpt.StartingLBA, Info->Info.Gpt.EndingLBA, (BlockIo != NULL) ? BlockIo->Media->LastBlock + 1 : 0,
+        (BlockIo != NULL) ? BlockIo->Media->BlockSize : 0));
+    } else {
+      DEBUG ((DEBUG_WARN, "ZumaUfs: partition of type %u\n", Info->Type));
+    }
+  }
 }
 
 EFI_STATUS
@@ -810,19 +994,25 @@ ZumaUfsDxeEntry (
   )
 {
   EFI_MEMORY_REGION_DESCRIPTOR  Ufs;
+  EFI_MEMORY_REGION_DESCRIPTOR  Unipro;
   EFI_HANDLE                    Handle;
   EFI_STATUS                    Status;
 
-  if (EFI_ERROR (LocateMemoryRegionByName ("UFS", &Ufs))) {
-    DEBUG ((DEBUG_ERROR, "ZumaUfs: no UFS region in the memory map\n"));
+  if (EFI_ERROR (LocateMemoryRegionByName ("UFS", &Ufs)) || EFI_ERROR (LocateMemoryRegionByName ("UFS UniPro", &Unipro))) {
+    DEBUG ((DEBUG_ERROR, "ZumaUfs: no UFS regions in the memory map\n"));
     return EFI_NOT_FOUND;
   }
 
-  mBase  = Ufs.Address;
-  Status = TakeOver ();
+  mBase   = Ufs.Address;
+  mUnipro = Unipro.Address;
+  Status  = Start ();
   if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "ZumaUfs: bring-up failed: %r\n", Status));
     return Status;
   }
+
+  mPartitionEvent = EfiCreateProtocolNotifyEvent (&gEfiPartitionInfoProtocolGuid, TPL_CALLBACK, OnPartition, NULL,
+                      &mPartitionRegistration);
 
   Handle = NULL;
   Status = gBS->InstallMultipleProtocolInterfaces (

@@ -1,5 +1,5 @@
 ##
-#  zuma's UFS host controller, taken over as Google's bootloader leaves it, as an EFI SCSI pass-through (read only).
+#  zuma's UFS host controller, brought up from scratch, as an EFI SCSI pass-through (read only).
 #
 #  Copyright (c) 2026, AkIOS contributors.
 #  SPDX-License-Identifier: BSD-2-Clause-Patent
@@ -34,10 +34,14 @@
   TimerLib
   UefiBootServicesTableLib
   UefiDriverEntryPoint
+  UefiLib
+  ZumaUfsCalLib
 
 [Protocols]
   gEfiDevicePathProtocolGuid        ## PRODUCES
   gEfiExtScsiPassThruProtocolGuid   ## PRODUCES
+  gEfiPartitionInfoProtocolGuid     ## NOTIFY
+  gEfiBlockIoProtocolGuid           ## CONSUMES
 
 [Depex]
   TRUE

@@ -31,6 +31,7 @@
 #define UFS_UTRLRSR   0x60    // run-stop
 #define UFS_UTRLCNR   0x64    // completion notification (write 1 to clear)
 #define UFS_UTMRLRSR  0x80
+#define UFS_UECPA     0x38    // UIC error code, PHY adapter layer (cleared by reading)
 #define UFS_UICCMD    0x90
 #define UFS_UICARG1   0x94
 #define UFS_UICARG2   0x98    // bits 7:0: the result (0 = success)
@@ -38,9 +39,28 @@
 
 #define UIC_DME_GET          0x01
 #define UIC_DME_SET          0x02
+#define UIC_DME_PEER_GET     0x03
 #define UIC_DME_LINKSTARTUP  0x16
+#define UIC_ARG_MIB(Attr)    ((UINT32)(Attr) << 16)
+#define IS_UPMS              (1 << 4)   // UIC power mode change completed
 #define IS_UCCS              (1 << 10)  // UIC command completed
-#define VS_GPIO_OUT          0x70       // vendor: the device's reset line (1 = released)
+#define HCS_UPMCRS(Hcs)      (((Hcs) >> 8) & 7)   // the power mode change's result
+#define UPMCRS_PWR_LOCAL     1
+
+//
+// UniPro PHY adapter attributes (MIPI UniPro), for the power mode change
+//
+#define PA_ACTIVETXDATALANES     0x1560
+#define PA_CONNECTEDTXDATALANES  0x1561
+#define PA_TXGEAR                0x1568
+#define PA_TXTERMINATION         0x1569
+#define PA_HSSERIES              0x156A
+#define PA_PWRMODE               0x1571
+#define PA_ACTIVERXDATALANES     0x1580
+#define PA_CONNECTEDRXDATALANES  0x1581
+#define PA_RXGEAR                0x1583
+#define PA_RXTERMINATION         0x1584
+#define PA_MAXRXHSGEAR           0x1587
 
 //
 // Samsung's vendor HCI registers (the phone's tree: the second range of ufs@13200000, at 0x1100): a request slot
@@ -49,14 +69,15 @@
 #define UFS_VS_HCI           0x1100
 #define VS_UTRL_NEXUS_TYPE   0x40
 #define VS_UTMRL_NEXUS_TYPE  0x44
+#define VS_GPIO_OUT          0x70       // the device's reset line (1 = released)
 
 #define HCS_DP        (1 << 0)
 #define HCS_UTRLRDY   (1 << 1)
 #define HCS_UTMRLRDY  (1 << 2)
 #define HCS_UCRDY     (1 << 3)
+#define HCS_READY     (HCS_UTRLRDY | HCS_UTMRLRDY | HCS_UCRDY)
 
 #define IS_UTRCS      (1 << 0)    // a transfer request completed
-#define IS_ERRORS     0x0000FC1Cu // UE, DFES, UTPES, HCFES, SBFES, CEFES and the like: anything that is not a completion
 
 #pragma pack(1)
 
