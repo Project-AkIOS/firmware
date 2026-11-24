@@ -61,7 +61,98 @@ STATIC ZUMA_UFS_PATH  mDevicePath = {
 };
 
 //
-// What reaches the device: reads and questions. Anything else is refused before it is built.
+// Writes: only into partitions AkIOS owns, by their GPT names, on the logical unit that holds them. The ranges come
+// from EDK2's partition driver (OnPartition); until a partition is known, no write reaches it. Everything else on
+// the phone -- Android, the bootloaders, persist, efs, modem, the other slot's images -- cannot be written from here.
+//
+STATIC CONST CHAR16  *mWritableNames[] = {
+  L"devinfo",     // the A/B slot state: the booted slot is marked successful (AkitaSlotDxe)
+  L"klog",        // the firmware's and the loader's log
+};
+STATIC CONST CHAR16  mIosPrefix[] = L"ios_";       // and every iOS volume (ios_system, ios_data, ...)
+
+typedef struct {
+  UINT8   Lun;
+  UINT64  First;
+  UINT64  Last;
+} WRITABLE_RANGE;
+
+STATIC WRITABLE_RANGE  mWritable[32];
+STATIC UINTN           mWritableCount;
+
+STATIC
+BOOLEAN
+IsWritableName (
+  IN CONST CHAR16  *Name
+  )
+{
+  UINTN  Index;
+
+  if (StrnCmp (Name, mIosPrefix, StrLen (mIosPrefix)) == 0) {
+    return TRUE;
+  }
+
+  for (Index = 0; Index < ARRAY_SIZE (mWritableNames); Index++) {
+    if (StrCmp (Name, mWritableNames[Index]) == 0) {
+      return TRUE;
+    }
+  }
+
+  return FALSE;
+}
+
+//
+// A command that writes the medium: WRITE(10)/(16) inside a writable range; SYNCHRONIZE CACHE writes nothing new.
+//
+STATIC
+BOOLEAN
+IsWriteCommand (
+  IN CONST UINT8  *Cdb
+  )
+{
+  return (Cdb[0] == EFI_SCSI_OP_WRITE10) || (Cdb[0] == EFI_SCSI_OP_WRITE16) || (Cdb[0] == EFI_SCSI_OP_SYNC_CACHE);
+}
+
+STATIC
+BOOLEAN
+WritePermitted (
+  IN UINT8        Lun,
+  IN CONST UINT8  *Cdb
+  )
+{
+  UINT64  Lba;
+  UINT64  Blocks;
+  UINTN   Index;
+
+  if (Cdb[0] == EFI_SCSI_OP_SYNC_CACHE) {
+    return TRUE;
+  }
+
+  if (Cdb[0] == EFI_SCSI_OP_WRITE10) {
+    Lba    = SwapBytes32 (ReadUnaligned32 ((CONST UINT32 *)&Cdb[2]));
+    Blocks = SwapBytes16 (ReadUnaligned16 ((CONST UINT16 *)&Cdb[7]));
+  } else {
+    Lba    = SwapBytes64 (ReadUnaligned64 ((CONST UINT64 *)&Cdb[2]));
+    Blocks = SwapBytes32 (ReadUnaligned32 ((CONST UINT32 *)&Cdb[10]));
+  }
+
+  if ((Blocks == 0) || (Lba + Blocks < Lba)) {
+    return FALSE;
+  }
+
+  for (Index = 0; Index < mWritableCount; Index++) {
+    if ((mWritable[Index].Lun == Lun) && (Lba >= mWritable[Index].First) && (Lba + Blocks - 1 <= mWritable[Index].Last)) {
+      return TRUE;
+    }
+  }
+
+  DEBUG ((DEBUG_ERROR, "ZumaUfs: write REFUSED: LUN %u LBA %lu, %lu blocks: not in a partition AkIOS may write\n", Lun, Lba,
+    Blocks));
+  return FALSE;
+}
+
+//
+// What reaches the device: reads, questions, and writes WritePermitted lets through. Anything else is refused.
 //
 STATIC
 BOOLEAN
@@ -78,6 +169,9 @@ Permitted (
     case EFI_SCSI_OP_READ_CAPACITY:
     case EFI_SCSI_OP_READ10:
     case EFI_SCSI_OP_READ16:
+    case EFI_SCSI_OP_WRITE10:           // (with WritePermitted)
+    case EFI_SCSI_OP_WRITE16:
+    case EFI_SCSI_OP_SYNC_CACHE:
       return TRUE;
     case EFI_SCSI_OP_READ_CAPACITY16:       // SERVICE ACTION IN(16): only READ CAPACITY(16)
       return (Cdb[1] & 0x1F) == 0x10;
@@ -144,8 +238,10 @@ Transfer (
   Read   = (Packet->DataDirection == EFI_EXT_SCSI_DATA_DIRECTION_READ);
   Length = Read ? Packet->InTransferLength : Packet->OutTransferLength;
   Data   = Read ? Packet->InDataBuffer : Packet->OutDataBuffer;
-  if (!Read && (Length != 0)) {
-    return EFI_UNSUPPORTED;                // a command that sends data: none is permitted yet
+  if (IsWriteCommand (Packet->Cdb) ? (Read && (Length != 0)) || !WritePermitted (Lun, Packet->Cdb)
+                                   : (!Read && (Length != 0)))
+  {
+    return EFI_WRITE_PROTECTED;            // data only goes out with a permitted write, and a write sends, never reads
   }
 
   if ((Length != 0) && ((Data == NULL) || (Length > PRDT_ENTRIES * PRDT_MAX_BYTES))) {
@@ -160,6 +256,10 @@ Transfer (
 
     Caller = Data;
     Data   = mBounce;
+    if (!Read) {
+      CopyMem (Data, Caller, Length);
+      ZeroMem (Data + Length, ALIGN_VALUE (Length, 4) - Length);
+    }
   }
 
   Mapped = ALIGN_VALUE (Length, 4);
@@ -176,7 +276,7 @@ Transfer (
   Response                = (RESPONSE_UPIU *)(mUcd + UCD_RESPONSE_OFFSET);
   Prdt                    = (PRDT_ENTRY *)(mUcd + UCD_PRDT_OFFSET);
   Command->Type           = UPIU_COMMAND;
-  Command->Flags          = (Length != 0) ? UPIU_FLAG_READ : 0;
+  Command->Flags          = (Length == 0) ? 0 : Read ? UPIU_FLAG_READ : UPIU_FLAG_WRITE;
   Command->Lun            = Lun;
   Command->TaskTag        = ++mTag;
   Command->ExpectedLength = SwapBytes32 (Length);
@@ -198,7 +298,7 @@ Transfer (
   //
   Utrd = &mList[0];
   ZeroMem (Utrd, sizeof (*Utrd));
-  Utrd->Dw0         = UTRD_CT_UFS | UTRD_INTERRUPT | ((Length != 0) ? UTRD_DD_FROM_DEVICE : UTRD_DD_NONE);
+  Utrd->Dw0         = UTRD_CT_UFS | UTRD_INTERRUPT | ((Length == 0) ? UTRD_DD_NONE : Read ? UTRD_DD_FROM_DEVICE : UTRD_DD_TO_DEVICE);
   Utrd->Dw2         = OCS_INVALID;
   Utrd->UcdBase     = (UINT32)(UINTN)mUcd;
   Utrd->UcdBaseHigh = (UINT32)((UINT64)(UINTN)mUcd >> 32);
@@ -210,7 +310,11 @@ Transfer (
   Flush (mUcd, UCD_SIZE);
   Flush (Utrd, sizeof (*Utrd));
   if (Length != 0) {
-    WriteBackInvalidateDataCacheRange (Data, Mapped);   // no dirty line may land on what the device writes
+    if (Read) {
+      WriteBackInvalidateDataCacheRange (Data, Mapped);   // no dirty line may land on what the device writes
+    } else {
+      WriteBackDataCacheRange (Data, Mapped);             // what the device reads is in memory
+    }
   }
 
   MmioWrite32 (mBase + UFS_IS, IS_UTRCS);
@@ -234,9 +338,6 @@ Transfer (
   Discard (mUcd, UCD_SIZE);
   if (Length != 0) {
     Discard (Data, Mapped);
-    if (Caller != NULL) {
-      CopyMem (Caller, Data, Length);
-    }
   }
 
   if ((Utrd->Dw2 & 0xFF) != OCS_SUCCESS) {
@@ -257,7 +358,25 @@ Transfer (
   }
 
   if (Read) {
-    Packet->InTransferLength = Length - MIN (Length, SwapBytes32 (Response->ResidualCount));
+    //
+    // What the device sent: nothing when the command failed, less than asked when it says so (underflow, bit 5:
+    // only then is the residual count valid). Only that much reaches the caller; the rest of its buffer is zeroed,
+    // never left with what an earlier transfer put in the bounce buffer.
+    //
+    UINT32  Done = (Response->Status != EFI_EXT_SCSI_STATUS_TARGET_GOOD) ? 0 :
+                   (Response->Flags & 0x20) ? Length - MIN (Length, SwapBytes32 (Response->ResidualCount)) : Length;
+
+    if (Length != 0) {
+      UINT8  *To = (Caller != NULL) ? Caller : Data;
+
+      if (Caller != NULL) {
+        CopyMem (Caller, Data, Done);
+      }
+
+      ZeroMem (To + Done, Length - Done);
+    }
+
+    Packet->InTransferLength = Done;
   }
 
   //
@@ -289,6 +408,72 @@ Transfer (
 }
 
 //
+// MODE SENSE(6), which UFS does not have (only MODE SENSE(10)): asked as MODE SENSE(10), the 8-byte header turned
+// into the 6-byte one. EDK2's disk driver takes the write protection from it (the device-specific parameter, bit 7).
+//
+STATIC
+EFI_STATUS
+ModeSense6 (
+  IN     UINT8                                       Lun,
+  IN OUT EFI_EXT_SCSI_PASS_THRU_SCSI_REQUEST_PACKET  *Packet
+  )
+{
+  EFI_EXT_SCSI_PASS_THRU_SCSI_REQUEST_PACKET  Ten;
+  UINT8                                       Cdb[10];
+  UINT8                                       *Six = Packet->InDataBuffer;
+  UINT8                                       *Data;
+  UINT32                                      Asked = Packet->InTransferLength;
+  UINT32                                      Got;
+  UINT32                                      Length10;
+  EFI_STATUS                                  Status;
+
+  Data = AllocateZeroPool (256 + 8);
+  if ((Data == NULL) || (Six == NULL) || (Asked < 4)) {
+    if (Data != NULL) {
+      FreePool (Data);
+    }
+
+    return EFI_INVALID_PARAMETER;
+  }
+
+  CopyMem (&Ten, Packet, sizeof (Ten));
+  ZeroMem (Cdb, sizeof (Cdb));
+  Cdb[0] = EFI_SCSI_OP_MODE_SEN10;
+  Cdb[1] = ((UINT8 *)Packet->Cdb)[1] & 0x08;      // DBD
+  Cdb[2] = ((UINT8 *)Packet->Cdb)[2];             // page control and code
+  Cdb[3] = ((UINT8 *)Packet->Cdb)[3];             // subpage
+  Cdb[7] = (UINT8)((MIN (Asked, 252u) + 4) >> 8);
+  Cdb[8] = (UINT8)(MIN (Asked, 252u) + 4);
+  Ten.Cdb              = Cdb;
+  Ten.CdbLength        = sizeof (Cdb);
+  Ten.InDataBuffer     = Data;
+  Ten.InTransferLength = MIN (Asked, 252u) + 4;
+  Status = Transfer (Lun, &Ten);
+  Packet->HostAdapterStatus = Ten.HostAdapterStatus;
+  Packet->TargetStatus      = Ten.TargetStatus;
+  Packet->SenseDataLength   = Ten.SenseDataLength;
+  ZeroMem (Six, Asked);
+  if (EFI_ERROR (Status) || (Ten.TargetStatus != EFI_EXT_SCSI_STATUS_TARGET_GOOD) || (Ten.InTransferLength < 8)) {
+    Packet->InTransferLength = 0;
+    FreePool (Data);
+    return Status;
+  }
+
+  Length10 = ((UINT32)Data[0] << 8) | Data[1];          // the bytes after the length field
+  Got      = MIN (Ten.InTransferLength, Length10 + 2);
+  Six[0]   = (UINT8)MIN (Got - 8 + 3, 255u);            // mode data length: the bytes after this one
+  Six[1]   = Data[2];                                    // medium type
+  Six[2]   = Data[3];                                    // device-specific parameter (bit 7: write protected)
+  Six[3]   = Data[7];                                    // block descriptor length (DBD: none)
+  CopyMem (Six + 4, Data + 8, MIN (Got - 8, Asked - 4));
+  Packet->InTransferLength = 4 + MIN (Got - 8, Asked - 4);
+  DEBUG ((DEBUG_WARN, "ZumaUfs: LUN %u MODE SENSE: device-specific parameter 0x%02x (%a)\n", Lun, Data[3],
+    (Data[3] & 0x80) ? "write protected" : "writable"));
+  FreePool (Data);
+  return EFI_SUCCESS;
+}
+
+//
 // EFI_EXT_SCSI_PASS_THRU_PROTOCOL: one target (id 0), its logical units 0..UFS_LUNS-1
 //
 STATIC
@@ -312,6 +497,10 @@ UfsPassThru (
 
   if (Lun >= UFS_LUNS) {
     return EFI_INVALID_PARAMETER;
+  }
+
+  if ((((UINT8 *)Packet->Cdb)[0] == EFI_SCSI_OP_MODE_SEN6) && (Packet->DataDirection == EFI_EXT_SCSI_DATA_DIRECTION_READ)) {
+    return ModeSense6 ((UINT8)Lun, Packet);
   }
 
   return Transfer ((UINT8)Lun, Packet);      // (synchronous: a non-blocking caller gets it done all the same)
@@ -946,7 +1135,7 @@ Start (
 }
 
 //
-// (bring-up) each partition EDK2's partition driver finds, with its GPT name
+// Each partition EDK2's partition driver finds: the writable ones are noted (WritePermitted), all are logged
 //
 STATIC EFI_EVENT  mPartitionEvent;
 STATIC VOID       *mPartitionRegistration;
@@ -976,6 +1165,26 @@ OnPartition (
 
     BlockIo = NULL;
     gBS->HandleProtocol (Handle, &gEfiBlockIoProtocolGuid, (VOID **)&BlockIo);
+    if ((Info->Type == PARTITION_TYPE_GPT) && IsWritableName (Info->Info.Gpt.PartitionName) &&
+        (mWritableCount < ARRAY_SIZE (mWritable)))
+    {
+      EFI_DEVICE_PATH_PROTOCOL  *Path;
+
+      if (!EFI_ERROR (gBS->HandleProtocol (Handle, &gEfiDevicePathProtocolGuid, (VOID **)&Path))) {
+        for ( ; !IsDevicePathEnd (Path); Path = NextDevicePathNode (Path)) {
+          if ((DevicePathType (Path) == MESSAGING_DEVICE_PATH) && (DevicePathSubType (Path) == MSG_SCSI_DP)) {
+            mWritable[mWritableCount].Lun   = (UINT8)((SCSI_DEVICE_PATH *)Path)->Lun;
+            mWritable[mWritableCount].First = Info->Info.Gpt.StartingLBA;
+            mWritable[mWritableCount].Last  = Info->Info.Gpt.EndingLBA;
+            DEBUG ((DEBUG_WARN, "ZumaUfs: writable: \"%s\" (LUN %u, LBA %lu-%lu)\n", Info->Info.Gpt.PartitionName,
+              mWritable[mWritableCount].Lun, mWritable[mWritableCount].First, mWritable[mWritableCount].Last));
+            mWritableCount++;
+            break;
+          }
+        }
+      }
+    }
+
     if (Info->Type == PARTITION_TYPE_GPT) {
       DEBUG ((DEBUG_WARN, "ZumaUfs: partition \"%s\": LBA %lu-%lu (%lu blocks of %u)\n", Info->Info.Gpt.PartitionName,
         Info->Info.Gpt.StartingLBA, Info->Info.Gpt.EndingLBA, (BlockIo != NULL) ? BlockIo->Media->LastBlock + 1 : 0,
@@ -1023,6 +1232,6 @@ ZumaUfsDxeEntry (
                   &mPassThru,
                   NULL
                   );
-  DEBUG ((DEBUG_WARN, "ZumaUfs: SCSI pass-through for LUN 0-%u (read only): %r\n", UFS_LUNS - 1, Status));
+  DEBUG ((DEBUG_WARN, "ZumaUfs: SCSI pass-through for LUN 0-%u (writes only to AkIOS's partitions): %r\n", UFS_LUNS - 1, Status));
   return Status;
 }
