@@ -23,8 +23,7 @@ gMemoryDescriptor[] = {
   // DDR: the framebuffer the bootloader left the panel reading (1080 x 2400 x 4), and the ramoops region (console,
   // then pmsg: the firmware's log goes into the pmsg zone, which Android shows as /sys/fs/pstore/pmsg-ramoops-0)
   {"Display Reserved",   0xFAC00000,  0x00A00000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_THROUGH},
-  // DDR: the bootloader's own memory (abl@f8800000): unused once it has started the firmware; the UFS controller's
-  // DMA reaches it (bring-up test: the firmware's UFS descriptors and bounce buffer live there)
+  // DDR: the bootloader's own memory (abl@f8800000): unused once it has started the firmware, kept out of its memory
   {"ABL",                0xF8800000,  0x01000000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, UNCACHED_UNBUFFERED},
   {"Ramoops",            0xFD3FF000,  0x00400000, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, UNCACHED_UNBUFFERED},
 
@@ -42,6 +41,7 @@ gMemoryDescriptor[] = {
   {"SYSREG UFS",         0x13020000,  0x00001000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
   {"GPIO HSI2",          0x13060000,  0x00001000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
   {"S2MPU HSI2",         0x131F0000,  0x00010000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
+  // ufs@13200000: standard and vendor HCI, the PHY (+0x4000) and CPort (+0x8000); UniPro and the UFS protector (+0x20000)
   {"UFS",                0x13200000,  0x00010000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
   {"UFS UniPro",         0x13280000,  0x00030000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
   {"PMU",                0x15460000,  0x00010000, AddDev, MMAP_IO, UNCACHEABLE, MmIO,   NS_DEVICE},
