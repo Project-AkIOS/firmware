@@ -78,6 +78,7 @@
   # Storage
   #
   ZumaPkg/Drivers/ZumaUfsDxe/ZumaUfsDxe.inf
+  akitaPkg/Drivers/AkitaSlotDxe/AkitaSlotDxe.inf
   MdeModulePkg/Bus/Scsi/ScsiBusDxe/ScsiBusDxe.inf
   MdeModulePkg/Bus/Scsi/ScsiDiskDxe/ScsiDiskDxe.inf
 

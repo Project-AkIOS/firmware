@@ -35,4 +35,5 @@
   INF MdeModulePkg/Universal/Disk/PartitionDxe/PartitionDxe.inf
   INF MdeModulePkg/Universal/Disk/UnicodeCollation/EnglishDxe/EnglishDxe.inf
   INF FatPkg/EnhancedFatDxe/Fat.inf
+  INF akitaPkg/Drivers/AkitaSlotDxe/AkitaSlotDxe.inf
   INF MdeModulePkg/Universal/BdsDxe/BdsDxe.inf

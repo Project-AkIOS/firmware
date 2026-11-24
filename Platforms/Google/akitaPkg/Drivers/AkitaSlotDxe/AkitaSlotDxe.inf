@@ -1,0 +1,37 @@
+##
+#  The Pixel 8a's A/B slot state: the slot Google's bootloader started is marked successful in devinfo, as Android's
+#  boot control does once Android is up, so the bootloader does not count its tries down and fall back to the other.
+#
+#  Copyright (c) 2026, AkIOS contributors.
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  INF_VERSION    = 0x00010019
+  BASE_NAME      = AkitaSlotDxe
+  FILE_GUID      = 3E7B9C14-0A52-4D8F-B6E1-95C2470F8A3D
+  MODULE_TYPE    = DXE_DRIVER
+  VERSION_STRING = 0.1
+  ENTRY_POINT    = AkitaSlotDxeEntry
+
+[Sources]
+  AkitaSlotDxe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+
+[LibraryClasses]
+  BaseLib
+  BaseMemoryLib
+  DebugLib
+  MemoryAllocationLib
+  UefiBootServicesTableLib
+  UefiDriverEntryPoint
+  UefiLib
+
+[Protocols]
+  gEfiBlockIoProtocolGuid         ## CONSUMES
+  gEfiPartitionInfoProtocolGuid   ## CONSUMES
+
+[Depex]
+  TRUE
