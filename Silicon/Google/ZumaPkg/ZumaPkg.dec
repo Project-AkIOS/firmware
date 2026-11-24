@@ -13,3 +13,7 @@
 
 [Includes]
   Include
+
+[LibraryClasses]
+  ## @libraryclass zuma's UFS host steps and Samsung's UFS CAL (GPL-2.0-only)
+  ZumaUfsCalLib|Include/Library/ZumaUfsCalLib.h

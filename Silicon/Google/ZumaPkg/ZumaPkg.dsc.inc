@@ -38,3 +38,5 @@
   PlatformSecLib|ZumaPkg/Library/PlatformSecLib/PlatformSecLib.inf
   # serial output: the ramoops pmsg zone (the log Android shows after a restart), then the screen
   SerialPortLib|ZumaPkg/Library/PstoreSerialPortLib/PstoreSerialPortLib.inf
+  # zuma's UFS host steps and Samsung's UFS CAL: GPL-2.0-only, a library of its own (see its LICENSE)
+  ZumaUfsCalLib|ZumaPkg/Library/ZumaUfsCalLib/ZumaUfsCalLib.inf

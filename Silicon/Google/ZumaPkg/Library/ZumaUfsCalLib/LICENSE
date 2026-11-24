@@ -1,0 +1,30 @@
+ZumaUfsCalLib is licensed under the GNU General Public License, version 2 only
+(SPDX: GPL-2.0-only), unlike the rest of this firmware (BSD-2-Clause-Patent).
+
+Why it is separate: zuma's UFS PHY does not start its link without Samsung's
+UFS calibration (CAL), and the only source of that CAL is Samsung's
+ufs-cal-if.c, ufs-cal-if.h, ufs-cal.h and ufs-vs-mmio.h for zuma, published
+under GPL-2.0-only in Google's kernel sources for Tensor G3 phones
+(drivers/ufs/zuma/). They are kept here, with Samsung's copyright notice and
+SPDX line as they came, in a library of their own, so that no GPL code ends up
+in the BSD-licensed files around it.
+
+What is here:
+  ufs-cal-if.c, ufs-cal-if.h, ufs-cal.h, ufs-vs-mmio.h
+      Samsung's CAL, Copyright 2022 Samsung Electronics Co., Ltd. Unchanged,
+      except one constant in ufs-cal-if.c (1000000UL -> 1000000ULL in
+      __get_mclk_period_unipro_18): the firmware's compiler has a 32-bit long,
+      and 16 * 1000 * 1000000 does not fit in it.
+  linux/io.h, linux/kernel.h, linux/types.h
+      The few Linux names the CAL uses (readl, writel, u8..u64, pr_info), on
+      EDK2's. The CAL is built as for the kernel, the variant Google's
+      Linux driver uses.
+  ZumaUfsHost.c
+      The vendor host steps around the standard UFSHCI bring-up and the calls
+      into the CAL, derived from Google's Linux driver drivers/ufs/ufs-exynos.c
+      (Copyright (C) 2013-2014 Samsung Electronics Co., Ltd.).
+
+The interface the BSD driver (ZumaPkg/Drivers/ZumaUfsDxe) calls is declared in
+ZumaPkg/Include/Library/ZumaUfsCalLib.h (declarations only).
+
+The full text of the GPL-2.0 license: https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt

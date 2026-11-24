@@ -1,0 +1,35 @@
+## @file
+#  zuma's UFS host: Samsung's UFS CAL (PHY calibration) and the vendor steps around the UFSHCI bring-up.
+#
+#  GPL-2.0-only, unlike the rest of the firmware: see LICENSE in this directory.
+#
+#  Copyright (c) 2026, AkIOS contributors.
+#  SPDX-License-Identifier: GPL-2.0-only
+##
+
+[Defines]
+  INF_VERSION    = 0x00010005
+  BASE_NAME      = ZumaUfsCalLib
+  FILE_GUID      = 4E2B7C19-A35D-4F86-B0E1-7D92C64A18F3
+  MODULE_TYPE    = BASE
+  VERSION_STRING = 1.0
+  LIBRARY_CLASS  = ZumaUfsCalLib
+
+[Sources]
+  ufs-cal-if.c
+  ufs-cal-if.h
+  ufs-cal.h
+  ufs-vs-mmio.h
+  linux/io.h
+  linux/kernel.h
+  linux/types.h
+  ZumaUfsHost.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  ZumaPkg/ZumaPkg.dec
+
+[LibraryClasses]
+  DebugLib
+  IoLib
+  TimerLib
