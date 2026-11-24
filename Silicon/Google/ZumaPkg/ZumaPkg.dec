@@ -1,0 +1,15 @@
+##
+#  Google Tensor G3 (zuma) silicon package.
+#
+#  Copyright (c) 2026, AkIOS contributors.
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  DEC_SPECIFICATION = 0x0001001B
+  PACKAGE_NAME      = ZumaPkg
+  PACKAGE_GUID      = 2B8F5D16-90C3-4E7A-B142-6D0E3A9F51C8
+  PACKAGE_VERSION   = 0.1
+
+[Includes]
+  Include
