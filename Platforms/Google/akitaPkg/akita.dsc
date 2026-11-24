@@ -63,9 +63,21 @@
   #
   MemoryMapLib|akitaPkg/Library/MemoryMapLib/MemoryMapLib.inf
 
+  #
+  # Storage Libraries (EDK2's SCSI bus and disk drivers, over the UFS pass-through)
+  #
+  UefiScsiLib|MdePkg/Library/UefiScsiLib/UefiScsiLib.inf
+
 [Components]
   #
   # ACPI Tables
   #
   #akita/AcpiTables.inf
+
+  #
+  # Storage
+  #
+  ZumaPkg/Drivers/ZumaUfsDxe/ZumaUfsDxe.inf
+  MdeModulePkg/Bus/Scsi/ScsiBusDxe/ScsiBusDxe.inf
+  MdeModulePkg/Bus/Scsi/ScsiDiskDxe/ScsiDiskDxe.inf
 

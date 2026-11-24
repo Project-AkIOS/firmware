@@ -1,0 +1,43 @@
+##
+#  zuma's UFS host controller, taken over as Google's bootloader leaves it, as an EFI SCSI pass-through (read only).
+#
+#  Copyright (c) 2026, AkIOS contributors.
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+
+[Defines]
+  INF_VERSION    = 0x00010019
+  BASE_NAME      = ZumaUfsDxe
+  FILE_GUID      = 9D4A1E62-7B30-4C58-A6F1-2E8C05B3D917
+  MODULE_TYPE    = DXE_DRIVER
+  VERSION_STRING = 0.1
+  ENTRY_POINT    = ZumaUfsDxeEntry
+
+[Sources]
+  ZumaUfsDxe.c
+  Ufshci.h
+
+[Packages]
+  MdePkg/MdePkg.dec
+  SiliciumPkg/SiliciumPkg.dec
+  ZumaPkg/ZumaPkg.dec
+
+[LibraryClasses]
+  BaseLib
+  BaseMemoryLib
+  CacheMaintenanceLib
+  DebugLib
+  DevicePathLib
+  IoLib
+  MemoryAllocationLib
+  MemoryMapHelperLib
+  TimerLib
+  UefiBootServicesTableLib
+  UefiDriverEntryPoint
+
+[Protocols]
+  gEfiDevicePathProtocolGuid        ## PRODUCES
+  gEfiExtScsiPassThruProtocolGuid   ## PRODUCES
+
+[Depex]
+  TRUE
